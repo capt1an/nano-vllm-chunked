@@ -3,13 +3,17 @@ from glob import glob
 import torch
 from torch import nn
 from safetensors import safe_open
-
+from huggingface_hub import snapshot_download
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
 
 
 def load_model(model: nn.Module, path: str):
+    if not os.path.exists(path):
+        path = snapshot_download(repo_id=path, local_files_only=True)
+        print(f"[nano-vLLM] 成功从本地 hfcache 提取路径: {path}")
+
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
