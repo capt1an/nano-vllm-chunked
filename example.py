@@ -4,7 +4,8 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("/home/huggingface/models--meta-llama--Meta-Llama-3-8B/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920")
+    # path = os.path.expanduser("/home/huggingface/models--meta-llama--Meta-Llama-3-8B/snapshots/8cde5ca8380496c9a6cc7ef3a8b46a0372a1d920")
+    path = "meta-llama/Meta-Llama-3-8B"
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 
