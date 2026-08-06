@@ -15,9 +15,8 @@ dependencies = [
     "torch==2.8.0",
     "triton>=3.0.0",
     "transformers>=4.51.0",
-   # "flash-attn==2.8.3",
+    "flash-attn==2.8.3",
     "xxhash",
-   # "flash-qla @ file:///srv/share/FlashQLA",
 ]
 
 [project.urls]

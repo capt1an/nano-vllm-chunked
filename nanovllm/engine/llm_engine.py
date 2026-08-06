@@ -35,8 +35,11 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        if not hasattr(self, "model_runner") or self.model_runner is None:
+            return
         self.model_runner.call("exit")
         del self.model_runner
+        self.model_runner = None
         for p in self.ps:
             p.join()
 
