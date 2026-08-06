@@ -8,16 +8,16 @@ from nanovllm import LLM, SamplingParams
 def main():
     seed(0)
     num_seqs = 256
-    max_input_len = 1024
-    max_ouput_len = 1024
+    max_input_len = 2048
+    max_ouput_len = 128
 
     path = os.path.expanduser("/home/huggingface/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca")
-    llm = LLM(path, enforce_eager=False, max_model_len=4096, max_num_seqs = 128, max_num_batched_tokens=512)
+    llm = LLM(path, enforce_eager=False, max_model_len=4096, max_num_seqs = 128, max_num_batched_tokens=1024, enable_continuous_batching=False, enable_chunked_prefill=True)
 
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
-    sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
-    # uncomment the following line for vllm
+    sampling_params = [SamplingParams(temperature=1e-6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
+    # uncomment the following line for vllmFalse
     # prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
 
     llm.generate(["Benchmark: "], SamplingParams())

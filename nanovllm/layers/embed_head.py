@@ -55,9 +55,26 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def forward(self, x: torch.Tensor):
         context = get_context()
-        if context.is_prefill:
-            last_indices = context.cu_seqlens_q[1:] - 1
-            x = x[last_indices].contiguous()
+
+        if context.has_prefill:
+            prefill_last = context.cu_seqlens_q[1:] - 1
+
+            if context.has_decode:
+                decode_indices = torch.arange(
+                    context.num_prefill_tokens,
+                    context.num_prefill_tokens + context.num_decode_seqs,
+                    device=x.device,
+                    dtype=prefill_last.dtype,
+                )
+
+                sample_indices = torch.cat(
+                    [prefill_last, decode_indices]
+                )
+            else:
+                sample_indices = prefill_last
+
+            x = x[sample_indices].contiguous()
+            
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None

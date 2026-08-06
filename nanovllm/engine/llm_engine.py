@@ -7,7 +7,7 @@ import torch.multiprocessing as mp
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import Sequence, SchedulerOutput
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
@@ -35,8 +35,11 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        if not hasattr(self, "model_runner") or self.model_runner is None:
+            return
         self.model_runner.call("exit")
         del self.model_runner
+        self.model_runner = None
         for p in self.ps:
             p.join()
 
@@ -47,12 +50,12 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens
+        output: SchedulerOutput = self.scheduler.schedule()
+        # print("scheduler output: ", output.seqs)
+        token_ids = self.model_runner.call("run", output)
+        self.scheduler.postprocess(output, token_ids)
+        finished = [(seq.seq_id, seq.completion_token_ids) for seq in output.seqs if seq.is_finished]
+        return finished, output.num_prefill_tokens, len(output.decode_seqs)
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -72,16 +75,18 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
-            if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
-            else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
+            finished, num_prefill_tokens, num_decode_tokens = self.step()
+            elapsed = perf_counter() - t
+            # Mixed batch: both counters update in the same step.
+            if num_prefill_tokens > 0:
+                prefill_throughput = num_prefill_tokens / elapsed
+            if num_decode_tokens > 0:
+                decode_throughput = num_decode_tokens / elapsed
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
             })
-            for seq_id, token_ids in output:
+            for seq_id, token_ids in finished:
                 outputs[seq_id] = token_ids
                 pbar.update(1)
         pbar.close()

@@ -5,10 +5,10 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import Sequence, SchedulerOutput
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.utils.context import Context, set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
 
@@ -97,7 +97,12 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        warmup_output = SchedulerOutput(
+            seqs=seqs,
+            num_prefill_seqs=len(seqs),
+            num_prefill_tokens=sum(s.num_scheduled_tokens for s in seqs),
+        )
+        self.run(warmup_output)
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -126,30 +131,45 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
+    def prepare_inputs(self, output: SchedulerOutput):
+        """将 prefill seqs 和 decode seqs 拼成一条扁平输入，同时构建 Context。
+
+        Token 布局（与 Context.slot_mapping / attention 层的分割点一致）：
+        ┌─────────────────────────────────┬──────────────────────────┐
+        │  prefill-seq-0 chunk  │ … │     │  decode-0  │  decode-1  │
+        └─────────────────────────────────┴──────────────────────────┘
+        ◄──────── num_prefill_tokens ─────►◄─── num_decode_seqs ─────►
+        """
+        input_ids: list[int] = []
+        positions:  list[int] = []
+
+        # ── prefill ──────────────────────────────────────────────────────────────
         cu_seqlens_q = [0]
         cu_seqlens_k = [0]
-        max_seqlen_q = 0
-        max_seqlen_k = 0
-        slot_mapping = []
-        block_tables = None
-        for seq in seqs:
-            start = seq.num_cached_tokens
+        max_seqlen_q = max_seqlen_k = 0
+        prefill_slots: list[int] = []
+        need_prefix_bt = False
+
+        for seq in output.prefill_seqs:
+            start    = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
-            end = start + seqlen_q
-            seqlen_k = end
+            end      = start + seqlen_q
+            seqlen_k = end                        # KV 可见长度 = 本 chunk 末尾
+
             input_ids.extend(seq[start:end])
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:    # warmup
+
+            if not seq.block_table:   # warmup，没有真实 KV cache
                 continue
+            if seqlen_k > seqlen_q:   # 有 prefix cache，需要 block_tables
+                need_prefix_bt = True
+
             start_block = start // self.block_size
-            end_block = (end + self.block_size - 1) // self.block_size
+            end_block   = (end + self.block_size - 1) // self.block_size
             for i in range(start_block, end_block):
                 slot_start = seq.block_table[i] * self.block_size
                 if i == start_block:
@@ -158,34 +178,46 @@ class ModelRunner:
                     slot_end = seq.block_table[i] * self.block_size + self.block_size
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
-                slot_mapping.extend(range(slot_start, slot_end))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
-        return input_ids, positions
+                prefill_slots.extend(range(slot_start, slot_end))
 
-    def prepare_decode(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        context_lens = []
-        for seq in seqs:
+        # ── decode ───────────────────────────────────────────────────────────────
+        decode_slots:  list[int] = []
+        context_lens:  list[int] = []
+
+        for seq in output.decode_seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
-        return input_ids, positions
+            decode_slots.append(
+                seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+            )
+
+        # ── 组装 tensors ──────────────────────────────────────────────────────────
+        def _cuda_i64(lst):
+            return torch.tensor(lst, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        def _cuda_i32(lst):
+            return torch.tensor(lst, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+        ctx = Context(
+            num_prefill_tokens = output.num_prefill_tokens,
+            num_decode_seqs    = len(output.decode_seqs),
+            # prefill
+            cu_seqlens_q       = _cuda_i32(cu_seqlens_q) if output.has_prefill else None,
+            cu_seqlens_k       = _cuda_i32(cu_seqlens_k) if output.has_prefill else None,
+            max_seqlen_q       = max_seqlen_q,
+            max_seqlen_k       = max_seqlen_k,
+            prefill_block_tables = self.prepare_block_tables(output.prefill_seqs)
+                                if need_prefix_bt else None,
+            # decode
+            context_lens       = _cuda_i32(context_lens) if output.has_decode else None,
+            decode_block_tables = self.prepare_block_tables(output.decode_seqs)
+                                if output.has_decode else None,
+            # 共享：prefill slots 在前，decode slots 在后，与 token 布局对齐
+            slot_mapping       = _cuda_i32(prefill_slots + decode_slots),
+        )
+        set_context(ctx)
+        return _cuda_i64(input_ids), _cuda_i64(positions)
+
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
@@ -193,32 +225,41 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """is_prefill 参数消失，改从 Context 读取。"""
+        context = get_context()
+        # 只有纯 decode 的小 batch 才能走 CUDA Graph
+        use_graph = (
+            context.is_pure_decode
+            and not self.enforce_eager
+            and input_ids.size(0) <= 512
+        )
+        if not use_graph:
             return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        bs = input_ids.size(0)
+        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        gv    = self.graph_vars
+        gv["input_ids"][:bs]   = input_ids
+        gv["positions"][:bs]   = positions
+        gv["slot_mapping"].fill_(-1)
+        gv["slot_mapping"][:bs] = context.slot_mapping          # 纯 decode，全是 decode slots
+        gv["context_lens"].zero_()
+        gv["context_lens"][:bs] = context.context_lens
+        gv["block_tables"][:bs, :context.decode_block_tables.size(1)] = context.decode_block_tables
+        graph.replay()
+        return self.model.compute_logits(gv["outputs"][:bs])
+
+
+    def run(self, output: SchedulerOutput) -> list[int]:
+        """替换原来的 run(seqs, is_prefill)。"""
+        input_ids, positions = self.prepare_inputs(output)
+        temperatures = self.prepare_sample(output.seqs) if self.rank == 0 else None
+        logits   = self.run_model(input_ids, positions)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
-
+    
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
@@ -237,7 +278,13 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context(Context(
+                num_prefill_tokens=0,
+                num_decode_seqs=bs,
+                slot_mapping=slot_mapping[:bs],
+                context_lens=context_lens[:bs],
+                decode_block_tables=block_tables[:bs],
+            ))
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture

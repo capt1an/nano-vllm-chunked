@@ -61,15 +61,28 @@ class Attention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
-        if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
-                k, v = k_cache, v_cache
-            o = flash_attn_varlen_func(q, k, v,
+
+        split = context.split   # == num_prefill_tokens
+        outputs: list[torch.Tensor] = []
+
+        if context.has_prefill:
+            q_p = q[:split]
+            if context.prefill_block_tables is not None:    # prefix cache
+                k_p, v_p = k_cache, v_cache
+            else:
+                k_p, v_p = k[:split], v[:split]
+                
+            o_p = flash_attn_varlen_func(q_p, k_p, v_p,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
-        else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
+                                       softmax_scale=self.scale, causal=True, block_table=context.prefill_block_tables)
+            outputs.append(o_p)
+
+        if context.has_decode:    # decode
+            q_d = q[split:]
+            o_d = flash_attn_with_kvcache(q_d.unsqueeze(1), k_cache, v_cache,
+                                        cache_seqlens=context.context_lens, block_table=context.decode_block_tables, 
                                         softmax_scale=self.scale, causal=True)
-        return o
+            outputs.append(o_d.squeeze(1))
+            
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
