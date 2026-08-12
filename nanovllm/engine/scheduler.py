@@ -96,6 +96,7 @@ class Scheduler:
 
             if not seq.block_table:
                 num_cached_blocks = self.block_manager.can_allocate(seq)
+                # print(" num cached blocks: ", num_cached_blocks)
                 if num_cached_blocks == -1:
                     break
                 num_tokens_needed = seq.num_tokens - num_cached_blocks * self.block_size
@@ -123,6 +124,7 @@ class Scheduler:
             )
 
         all_seqs = prefill_seqs + decode_seqs
+        # self.block_manager.print_status()
         return SchedulerOutput(
             seqs=all_seqs,
             num_prefill_seqs=len(prefill_seqs),
@@ -268,6 +270,7 @@ class Scheduler:
                 or seq.num_completion_tokens == seq.max_tokens
             ):
                 seq.status = SequenceStatus.FINISHED
+                # print("触发deallocate!")
                 self.block_manager.deallocate(seq)
                 # running.remove is O(n) but the list is short in practice.
                 if seq in self.running:

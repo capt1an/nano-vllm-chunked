@@ -52,26 +52,6 @@ The following is a long system instruction:
         max_num_batched_tokens=16384,
     )
 
-    # ── Legacy ───────────────────────────────────────────────────────────────
-    # print("=" * 60)
-    # print("Mode: Legacy (enable_continuous_batching=False)")
-    # print("=" * 60)
-    # torch.manual_seed(42)
-    # if torch.cuda.is_available():
-    #     torch.cuda.manual_seed(42)
-    # llm_legacy = LLM(path, **engine_kwargs,
-    #                  enable_continuous_batching=False,
-    #                  enable_chunked_prefill=True)
-    # outputs_legacy = llm_legacy.generate(prompts, sampling_params)
-    # for output in outputs_legacy:
-    #     print()
-    #     print("=" * 50)
-    #     print(tokenizer.decode(output["token_ids"]))
-    # llm_legacy.exit()
-    # del llm_legacy
-    # torch.cuda.empty_cache()
-    # torch.cuda.reset_peak_memory_stats()
-
     # ── Continuous Batching ──────────────────────────────────────────────────
     print()
     print("=" * 60)
@@ -83,11 +63,24 @@ The following is a long system instruction:
     llm_cb = LLM(path, **engine_kwargs,
                  enable_continuous_batching=True,
                  enable_chunked_prefill=True)
-    outputs_cb = llm_cb.generate(prompts, sampling_params)
-    for output in outputs_cb:
-        print()
-        print("=" * 50)
-        print(tokenizer.decode(output["token_ids"]))
+    
+    llm_cb.add_request(prompts[0], sampling_params)
+    # 跑几步，让A进入decode
+    for _ in range(20):
+        llm_cb.step()
+
+
+    # 此时A:
+    # running
+    # block ref_count=1
+
+    # request B到来
+    llm_cb.add_request(prompts[1], sampling_params)
+
+    # 再跑
+    for _ in range(10):
+        llm_cb.step()
+
     llm_cb.exit()
     del llm_cb
 
