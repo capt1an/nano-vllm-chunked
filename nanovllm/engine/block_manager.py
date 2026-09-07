@@ -1,8 +1,48 @@
-from collections import deque
-import xxhash
+from collections import OrderedDict
+
 import numpy as np
+import xxhash
 
 from nanovllm.engine.sequence import Sequence
+
+
+class EvictableBlockQueue:
+    """An O(1) queue for every block whose reference count is zero.
+
+    Cached blocks and blocks without reusable contents intentionally share the
+    same queue. Cached blocks are kept in LRU order at the back; uncached
+    blocks are returned to the front so they can be reused without evicting a
+    useful prefix.
+    """
+
+    def __init__(self, block_ids):
+        self._block_ids = OrderedDict.fromkeys(block_ids)
+
+    def __len__(self):
+        return len(self._block_ids)
+
+    def __iter__(self):
+        return iter(self._block_ids)
+
+    def popleft(self) -> int:
+        if not self._block_ids:
+            raise RuntimeError("No evictable KV cache block is available")
+        block_id, _ = self._block_ids.popitem(last=False)
+        return block_id
+
+    def append(self, block_id: int):
+        assert block_id not in self._block_ids
+        self._block_ids[block_id] = None
+
+    def appendleft(self, block_id: int):
+        self.append(block_id)
+        self._block_ids.move_to_end(block_id, last=False)
+
+    def remove(self, block_id: int):
+        del self._block_ids[block_id]
+
+    def __contains__(self, block_id: int):
+        return block_id in self._block_ids
 
 
 class Block:
@@ -12,8 +52,7 @@ class Block:
         self.ref_count = 0
         self.hash = -1
         self.token_ids = []
-        self.last_access_time = 0
-        
+
     def update(self, hash: int, token_ids: list[int]):
         self.hash = hash
         self.token_ids = token_ids
@@ -22,7 +61,6 @@ class Block:
         self.ref_count = 1
         self.hash = -1
         self.token_ids = []
-        self.last_access_time = 0
 
 
 class BlockManager:
@@ -30,11 +68,10 @@ class BlockManager:
     def __init__(self, num_blocks: int, block_size: int):
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
-        self.used_block_ids: set[int] = set() # ref_count=0 hash=-1
-        self.cached_block_ids: set[int] = set() # ref_count=0 hash!=-1
-        self.time = 0
+        # Duplicate physical blocks can contain the same prefix when requests
+        # are computed together, so one hash may map to multiple block IDs.
+        self.hash_to_block_ids: dict[int, set[int]] = {}
+        self.free_block_ids = EvictableBlockQueue(range(num_blocks))
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -44,97 +81,97 @@ class BlockManager:
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
 
+    def _cache_block(self, block: Block):
+        self.hash_to_block_ids.setdefault(block.hash, set()).add(block.block_id)
+
+    def _uncache_block(self, block: Block):
+        if block.hash == -1:
+            return
+        block_ids = self.hash_to_block_ids.get(block.hash)
+        if block_ids is not None:
+            block_ids.discard(block.block_id)
+            if not block_ids:
+                del self.hash_to_block_ids[block.hash]
+        block.hash = -1
+        block.token_ids = []
+
+    def _find_cached_block(self, block_hash: int, token_ids: list[int]):
+        idle_match = None
+        for block_id in self.hash_to_block_ids.get(block_hash, ()):
+            block = self.blocks[block_id]
+            if block.token_ids == token_ids:
+                # Sharing an already used block consumes no evictable block,
+                # so prefer it when duplicate physical copies exist.
+                if block.ref_count > 0:
+                    return block
+                idle_match = block
+        return idle_match
+
     def _allocate_block(self) -> int:
-        if len(self.free_block_ids)==0:
-            self._evict_block()
         block_id = self.free_block_ids.popleft()
         block = self.blocks[block_id]
         assert block.ref_count == 0
-        # if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
-        #     del self.hash_to_block_id[block.hash]
+        self._uncache_block(block)
         block.reset()
-        self.used_block_ids.add(block_id)
         return block_id
 
-    def _deallocate_block(self, block_id: int):
-        # block = self.blocks[block_id]
-        assert self.blocks[block_id].ref_count == 0
-        self.used_block_ids.remove(block_id)
-        block = self.blocks[block_id]
-        # deallocate 的请求block难道会是一个没有hash的block吗？应该只需要添加到cached_block_ids中就行了。
-        # 并不是这样，因为涉及到prefix cache的最后一个未满的block，
-        if block.hash != -1: # hash ！= -1 表示是一个占满的block，可以被用来prefix
-            self.cached_block_ids.add(block_id)
-        else: # hash = -1 表示是一个没有占满的block，直接释放掉就行了
-            self.free_block_ids.append(block_id)
-
-    # lru eviction
-    def _evict_block(self):
-        if not self.cached_block_ids:
-            return None
-        victim = min(self.cached_block_ids, key=lambda x: self.blocks[x].last_access_time)
-        block = self.blocks[victim]
-        del self.hash_to_block_id[block.hash]
-        self.cached_block_ids.remove(victim)
-        # block.reset() 
-        self.free_block_ids.append(victim)
-        # print("victim idx:", victim, "hash:", block.hash, "last_access_time:", block.last_access_time)
-        
+    def _touch_block(self, block: Block):
+        if block.ref_count == 0:
+            self.free_block_ids.remove(block.block_id)
+        block.ref_count += 1
 
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
         num_cached_blocks = 0
-        num_new_blocks = seq.num_blocks
-        # print("seq.num_blocks", seq.num_blocks)
+        num_used_hits = 0
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            block = self._find_cached_block(h, token_ids)
+            if block is None:
                 break
             num_cached_blocks += 1
-            # if block_id in self.used_block_ids:
-            #     num_new_blocks -= 1
-        
-        num_new_blocks = seq.num_blocks - num_cached_blocks
-        if len(self.free_block_ids) + len(self.cached_block_ids) < num_new_blocks:
+            if block.ref_count > 0:
+                num_used_hits += 1
+
+        # A cached block with ref_count == 0 is still in the free queue. It
+        # must be reserved by this request and cannot also fund a new block.
+        num_required_blocks = seq.num_blocks - num_used_hits
+        if len(self.free_block_ids) < num_required_blocks:
             return -1
         return num_cached_blocks
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
         h = -1
-        # print("开始allocate", num_cached_blocks)
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id[h]
-            block = self.blocks[block_id]
-            if block_id in self.used_block_ids:
-                block.ref_count += 1
-            else:
-                block.ref_count = 1
-                self.cached_block_ids.remove(block_id)
-                self.used_block_ids.add(block_id)
-            seq.block_table.append(block_id)
-            self.time += 1
-            block.last_access_time = self.time
-            # print("触发prefix cache !")
-        for i in range(num_cached_blocks, seq.num_blocks):
+            block = self._find_cached_block(h, token_ids)
+            assert block is not None
+            self._touch_block(block)
+            seq.block_table.append(block.block_id)
+        for _ in range(num_cached_blocks, seq.num_blocks):
             seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 
     def deallocate(self, seq: Sequence):
+        # Releasing in reverse order makes request-specific suffix blocks
+        # eviction candidates before the more reusable prefix blocks.
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
+            assert block.ref_count > 0
             block.ref_count -= 1
             if block.ref_count == 0:
-                self._deallocate_block(block_id)
+                if block.hash == -1:
+                    self.free_block_ids.appendleft(block_id)
+                else:
+                    self.free_block_ids.append(block_id)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) + len(self.cached_block_ids) >= (len(seq) % self.block_size == 1)
+        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
         if len(seq) % self.block_size == 1:
@@ -143,63 +180,45 @@ class BlockManager:
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
-        if start == end: return
+        if start == end:
+            return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
-            self.hash_to_block_id[h] = block.block_id
-            self.time+=1
-            block.last_access_time=self.time
-
+            self._cache_block(block)
 
     def print_status(self):
         print("=" * 80)
         print("Block Manager Status")
         print(f"Total blocks: {len(self.blocks)}")
-        print(f"Used blocks: {len(self.used_block_ids)}")
-        print(f"Free blocks: {len(self.free_block_ids)}")
-        print(f"Cached blocks: {sum(1 for b in self.blocks if b.hash != -1 and b.ref_count == 0)}")
+        print(f"Used blocks: {sum(block.ref_count > 0 for block in self.blocks)}")
+        print(f"Evictable blocks: {len(self.free_block_ids)}")
+        print(f"Cached blocks: {sum(block.hash != -1 for block in self.blocks)}")
         print("-" * 80)
-
-        print("free_block_ids:")
+        print("Eviction order (first to last):")
         print(list(self.free_block_ids))
-
-        print("\nused_block_ids:")
-        print(sorted(list(self.used_block_ids)))
-
         print("-" * 80)
         print("Block details:")
-
         for block in self.blocks:
-            if (
-                block.block_id in self.used_block_ids
-                or block.hash != -1
-                or block.ref_count > 0
-            ):
-                if block.block_id in self.used_block_ids:
-                    state = "USED"
-                elif block.hash != -1:
-                    state = "CACHED"
-                else:
-                    state = "FREE"
-
-                print(
-                    f"Block {block.block_id:4d} | "
-                    f"{state:6s} | "
-                    f"ref={block.ref_count} | "
-                    f"hash={block.hash} | "
-                    f"last_access={block.last_access_time} | "
-                    f"tokens={block.token_ids[:8]}"
-                    f"{'...' if len(block.token_ids) > 8 else ''}"
-                )
-
+            if block.ref_count > 0:
+                state = "USED"
+            elif block.hash != -1:
+                state = "CACHED"
+            else:
+                state = "FREE"
+            print(
+                f"Block {block.block_id:4d} | "
+                f"{state:6s} | "
+                f"ref={block.ref_count} | "
+                f"hash={block.hash} | "
+                f"tokens={block.token_ids[:8]}"
+                f"{'...' if len(block.token_ids) > 8 else ''}"
+            )
         print("-" * 80)
-
-        print("hash_to_block_id:")
-        for h, block_id in self.hash_to_block_id.items():
-            print(f"{h} -> block {block_id}")
-
+        print("hash_to_block_ids:")
+        for h, block_ids in self.hash_to_block_ids.items():
+            print(f"{h} -> blocks {sorted(block_ids)}")
         print("=" * 80)
