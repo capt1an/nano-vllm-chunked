@@ -2,10 +2,12 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
 
 
 _MODEL_REGISTRY: dict[str, type[nn.Module]] = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
+    "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
 }
 
 
