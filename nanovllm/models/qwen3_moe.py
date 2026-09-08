@@ -1,8 +1,4 @@
-"""Qwen3-MoE model scaffold.
-
-This first implementation intentionally uses a readable ModuleList of experts.
-It is meant to establish numerical correctness with tensor parallelism before
-adding a fused MoE kernel or expert parallelism.
+"""Correctness-first Qwen3-MoE implementation for tensor/expert parallelism.
 
 The target checkpoint is Qwen/Qwen3-30B-A3B-Instruct-2507.  Its relevant
 configuration is:
@@ -14,32 +10,76 @@ configuration is:
 * moe_intermediate_size=768
 * norm_topk_prob=True
 
-Do not add EP-specific sharding to this file yet.  With tensor_parallel_size=2,
-the existing parallel linear layers shard every expert's MLP weights, which is
-enough for the BF16 checkpoint to fit on the two RTX A6000 GPUs.
+With EP disabled, each expert uses tensor-parallel linear layers. With EP
+enabled, experts are sharded between EP ranks and each local expert is complete.
 """
 
 import torch
 from torch import nn
-import torch.nn.functional as F
+import torch.distributed as dist
 from transformers import Qwen3MoeConfig
 
+from nanovllm.distributed import (
+    get_expert_parallel_group,
+    get_expert_parallel_rank,
+    get_expert_parallel_world_size,
+    is_expert_parallel_enabled,
+)
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import ReplicatedLinear
+from nanovllm.layers.linear import MergedReplicatedLinear, ReplicatedLinear
+from nanovllm.layers.activation import SiluAndMul
+from nanovllm.layers.moe_permute import counting_sort_moe_routes
 from nanovllm.models.qwen3 import Qwen3Attention, Qwen3MLP
+
+
+def get_local_expert_range(
+    num_experts: int,
+    ep_rank: int,
+    ep_size: int,
+) -> tuple[int, int]:
+    if num_experts % ep_size != 0:
+        raise ValueError(
+            f"num_experts ({num_experts}) must be divisible by EP size ({ep_size})"
+        )
+    experts_per_rank = num_experts // ep_size
+    start = ep_rank * experts_per_rank
+    return start, start + experts_per_rank
+
+
+class Qwen3MoeExpertMLP(nn.Module):
+    """A complete local expert with no tensor-parallel collective."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+    ):
+        super().__init__()
+        self.gate_up_proj = MergedReplicatedLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+        )
+        self.down_proj = ReplicatedLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+        )
+        assert hidden_act == "silu"
+        self.act_fn = SiluAndMul()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up_proj(hidden_states)
+        return self.down_proj(self.act_fn(gate_up))
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
     """Readable correctness-first MoE block.
 
-    Each expert uses nano-vLLM's existing tensor-parallel Qwen3MLP.  The router
-    is replicated on every TP rank, so all ranks select the same experts and
-    execute RowParallelLinear collectives in the same expert order.
-
-    This is deliberately not a fast implementation: Python dispatch and 128
-    separate expert modules are useful for learning and correctness checking.
-    A fused/grouped implementation belongs in a later optimization commit.
+    The router is replicated. EP ranks own disjoint complete experts and sum
+    their partial token outputs once at the end of the block.
     """
 
     def __init__(self, config: Qwen3MoeConfig):
@@ -48,6 +88,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
+        self.use_ep = is_expert_parallel_enabled()
+        self.ep_rank = get_expert_parallel_rank()
+        self.ep_size = get_expert_parallel_world_size()
+        self.ep_group = get_expert_parallel_group()
+        self.first_expert_id, self.last_expert_id = get_local_expert_range(
+            self.num_experts,
+            self.ep_rank,
+            self.ep_size,
+        )
 
         # The checkpoint key is ``model.layers.N.mlp.gate.weight`` with shape
         # [num_experts, hidden_size].  ReplicatedLinear preserves that name and
@@ -58,17 +107,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             bias=False,
         )
 
-        # Qwen3MLP names its packed first projection ``gate_up_proj``.  The
-        # packed_modules_mapping on Qwen3MoeForCausalLM below maps each expert's
-        # separate gate_proj/up_proj checkpoint tensors into that parameter.
-        self.experts = nn.ModuleList([
-            Qwen3MLP(
+        expert_cls = Qwen3MoeExpertMLP if self.use_ep else Qwen3MLP
+        # Global ids are kept as ModuleDict keys so local parameter names still
+        # match checkpoint paths such as ``mlp.experts.64.gate_proj.weight``.
+        self.experts = nn.ModuleDict({
+            str(expert_id): expert_cls(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.moe_intermediate_size,
                 hidden_act=config.hidden_act,
             )
-            for _ in range(config.num_experts)
-        ])
+            for expert_id in range(self.first_expert_id, self.last_expert_id)
+        })
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Route every token to top-k experts and combine their outputs.
@@ -81,34 +130,34 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         Returns:
             Tensor with the same shape and dtype as ``hidden_states``.
         """
-        # TODO(you): implement the correctness-first routing path in five steps.
-        #
-        # 1. Validate/understand the input shape, then compute router logits:
-        #       [T, H] -> self.gate -> [T, E]
         router_logits = self.gate(hidden_states)
 
-        # 2. Compute softmax in float32 along the expert dimension.  Select
-        #    self.top_k values and expert ids for every token.  Expected shapes:
-        #       routing_weights: [T, K]
-        #       selected_experts: [T, K]
-        #    Convert the selected weights back to hidden_states.dtype only after
-        #    softmax/top-k.  Compare this detail with Transformers' reference.
-        router_logits = torch.softmax(router_logits, dim=-1, dtype=torch.float32) # fp32
+        router_logits = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
         routing_weights, selected_experts = torch.topk(router_logits, k=self.top_k, dim=-1)
 
-        # 3. Because this checkpoint has norm_topk_prob=True, divide each row of
-        #    the selected weights by its row sum.  Keep the code conditional so
-        #    the block remains correct for other Qwen3-MoE checkpoints.
         if self.norm_topk_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(hidden_states.dtype)
 
-        # 4. Allocate an output with torch.zeros_like(hidden_states).  Iterate
-        #    expert ids in ascending order.  For each expert, locate every
-        #    (token_index, topk_slot) pair assigned to it, gather those tokens,
-        #    call self.experts[expert_id], multiply by the corresponding routing
-        #    weights, and accumulate with index_add_.  A token appears K times,
-        #    so ordinary indexed assignment would be incorrect.
+        if self.use_ep:
+            return self._forward_expert_parallel(
+                hidden_states,
+                routing_weights,
+                selected_experts,
+            )
+        return self._forward_tensor_parallel(
+            hidden_states,
+            routing_weights,
+            selected_experts,
+        )
+
+    def _forward_tensor_parallel(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+    ) -> torch.Tensor:
+        """Preserve the original TP=2, EP=1 reference implementation."""
         T, K = selected_experts.shape
         tokenids = torch.arange(T, device=hidden_states.device).repeat_interleave(K)
         expertids = selected_experts.reshape(-1)
@@ -120,26 +169,63 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         output = torch.zeros_like(permuted_hidden_states)
         startidx = 0
-        for expert_id, expert in enumerate(self.experts):
+        for expert_id in range(self.num_experts):
             count = token_per_expert[expert_id].item()
             endidx = startidx + count
             if count != 0:
-                output[startidx:endidx] = expert(permuted_hidden_states[startidx:endidx])
+                output[startidx:endidx] = self.experts[str(expert_id)](
+                    permuted_hidden_states[startidx:endidx]
+                )
             startidx = endidx
 
         unpermuted_output = torch.empty_like(output)
         unpermuted_output[permuteidx] = output
         unpermuted_output = unpermuted_output.view(T, K, hidden_states.shape[-1])
 
-        # 5. Return the accumulated output and assert its shape matches the
-        #    input while debugging.
-        #
-        # TP warning: do not skip experts differently on different TP ranks.
-        # RowParallelLinear performs an all_reduce, so every rank must call the
-        # same non-empty experts in the same order or the process can deadlock.
-        output = (unpermuted_output * routing_weights.unsqueeze(-1)).sum(dim=1)
+        return (unpermuted_output * routing_weights.unsqueeze(-1)).sum(dim=1)
 
-        return output
+    def _forward_expert_parallel(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute local expert contributions and combine them over EP ranks."""
+        _, top_k = selected_experts.shape
+        routing_plan = counting_sort_moe_routes(
+            selected_experts,
+            self.first_expert_id,
+            self.last_expert_id,
+        )
+        sorted_route_ids = routing_plan.sorted_route_ids
+        sorted_token_ids = sorted_route_ids // top_k
+        sorted_route_weights = routing_weights.reshape(-1)[sorted_route_ids]
+        permuted_hidden_states = hidden_states[sorted_token_ids]
+        expert_outputs = torch.empty_like(permuted_hidden_states)
+
+        # Copy all offsets with one synchronization instead of calling .item()
+        # once per expert. TODO(you): replace this loop with grouped GEMM.
+        expert_offsets = routing_plan.expert_offsets.tolist()
+        for local_expert_id in range(self.last_expert_id - self.first_expert_id):
+            start = expert_offsets[local_expert_id]
+            end = expert_offsets[local_expert_id + 1]
+            if start == end:
+                continue
+            global_expert_id = self.first_expert_id + local_expert_id
+            expert_outputs[start:end] = self.experts[str(global_expert_id)](
+                permuted_hidden_states[start:end]
+            )
+
+        local_output = torch.zeros_like(hidden_states)
+        local_output.index_add_(
+            0,
+            sorted_token_ids,
+            expert_outputs * sorted_route_weights.unsqueeze(-1),
+        )
+
+        # Every EP rank must participate, including ranks with zero local tokens.
+        dist.all_reduce(local_output, group=self.ep_group)
+        return local_output
 
 
 class Qwen3MoeDecoderLayer(nn.Module):
@@ -233,6 +319,13 @@ class Qwen3MoeForCausalLM(nn.Module):
 
     def __init__(self, config: Qwen3MoeConfig):
         super().__init__()
+        ep_rank = get_expert_parallel_rank()
+        ep_size = get_expert_parallel_world_size()
+        self.first_expert_id, self.last_expert_id = get_local_expert_range(
+            config.num_experts,
+            ep_rank,
+            ep_size,
+        )
         self.model = Qwen3MoeModel(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
@@ -247,3 +340,11 @@ class Qwen3MoeForCausalLM(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    def is_weight_local(self, weight_name: str) -> bool:
+        """Return whether an expert checkpoint tensor belongs to this EP rank."""
+        marker = ".experts."
+        if marker not in weight_name:
+            return True
+        expert_id = int(weight_name.split(marker, 1)[1].split(".", 1)[0])
+        return self.first_expert_id <= expert_id < self.last_expert_id

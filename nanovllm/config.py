@@ -11,6 +11,7 @@ class Config:
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
+    enable_expert_parallel: bool = False
     enforce_eager: bool = False
     enable_continuous_batching: bool = True
     enable_chunked_prefill: bool = True
@@ -25,3 +26,8 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+
+    @property
+    def world_size(self) -> int:
+        # With no DP/PP yet, EP reuses the TP ranks rather than adding ranks.
+        return self.tensor_parallel_size

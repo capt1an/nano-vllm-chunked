@@ -19,8 +19,6 @@ class ModelRegistryTest(unittest.TestCase):
         )
 
     def test_resolves_qwen3_moe(self):
-        # Registry support is independent of whether the model's TODO forward
-        # path has been implemented yet.
         config = SimpleNamespace(
             architectures=["Qwen3MoeForCausalLM"],
         )

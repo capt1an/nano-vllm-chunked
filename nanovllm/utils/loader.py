@@ -15,9 +15,14 @@ def load_model(model: nn.Module, path: str):
         print(f"[nano-vLLM] 成功从本地 hfcache 提取路径: {path}")
 
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    is_weight_local = getattr(model, "is_weight_local", None)
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
+                # EP ranks do not instantiate remote experts. Check ownership
+                # before materializing the checkpoint tensor on CPU.
+                if is_weight_local is not None and not is_weight_local(weight_name):
+                    continue
                 for k in packed_modules_mapping:
                     if k in weight_name:
                         v, shard_id = packed_modules_mapping[k]

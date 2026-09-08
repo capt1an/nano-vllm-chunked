@@ -17,6 +17,11 @@ def main():
     parser.add_argument("--prompt", default="请用三句话解释什么是混合专家（MoE）模型。")
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--enable-expert-parallel",
+        action="store_true",
+        help="Use the TP ranks as EP ranks for MoE FFN layers.",
+    )
     args = parser.parse_args()
     if args.max_tokens <= 0:
         parser.error("--max-tokens 必须大于 0")
@@ -53,12 +58,14 @@ def main():
     if len(prompt_ids) + args.max_tokens > max_model_len:
         parser.error("prompt token 数 + --max-tokens 不能超过本示例的 1024 token 上限")
 
-    print(f"输入 {len(prompt_ids)} tokens；TP=2，EP 未启用，CUDA Graph 关闭", flush=True)
+    ep_mode = "EP=2" if args.enable_expert_parallel else "EP 未启用"
+    print(f"输入 {len(prompt_ids)} tokens；TP=2，{ep_mode}，CUDA Graph 关闭", flush=True)
     print("开始加载权重和 warmup（首次 torch.compile 可能较慢）……", flush=True)
     start = perf_counter()
     llm = LLM(
         args.model,
         tensor_parallel_size=2,
+        enable_expert_parallel=args.enable_expert_parallel,
         enforce_eager=True,
         max_model_len=max_model_len,
         max_num_batched_tokens=1024,
