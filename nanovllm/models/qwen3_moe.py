@@ -30,6 +30,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import MergedReplicatedLinear, ReplicatedLinear
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.moe_permute import counting_sort_moe_routes
+from nanovllm.layers.moe_grouped import grouped_moe
 from nanovllm.models.qwen3 import Qwen3Attention, Qwen3MLP
 
 
@@ -118,6 +119,28 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
             for expert_id in range(self.first_expert_id, self.last_expert_id)
         })
+        if self.use_ep:
+            # 仅初始化时打包；forward 不复制权重。buffer 不增加 state_dict 键。
+            self.register_buffer("grouped_gate_up", torch.stack([
+                expert.gate_up_proj.weight.detach() for expert in self.experts.values()
+            ]), persistent=False)
+            self.register_buffer("grouped_down", torch.stack([
+                expert.down_proj.weight.detach() for expert in self.experts.values()
+            ]), persistent=False)
+            self._bind_grouped_weights()
+
+    def _bind_grouped_weights(self):
+        # 保留原 checkpoint 参数名和 weight_loader，但参数直接引用连续专家缓冲区。
+        for local_id, expert in enumerate(self.experts.values()):
+            expert.gate_up_proj.weight.data = self.grouped_gate_up[local_id]
+            expert.down_proj.weight.data = self.grouped_down[local_id]
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        if self.use_ep:
+            # .to() / dtype 转换后重新建立参数与缓冲区的共享存储。
+            self._bind_grouped_weights()
+        return result
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Route every token to top-k experts and combine their outputs.
@@ -191,39 +214,21 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         selected_experts: torch.Tensor,
     ) -> torch.Tensor:
         """Compute local expert contributions and combine them over EP ranks."""
-        _, top_k = selected_experts.shape
+        # 容量模式无需 .item()；有效路由数和专家桶边界始终保留在 GPU。
         routing_plan = counting_sort_moe_routes(
             selected_experts,
             self.first_expert_id,
             self.last_expert_id,
+            capacity_buffer=True,
         )
-        sorted_route_ids = routing_plan.sorted_route_ids
-        sorted_token_ids = sorted_route_ids // top_k
-        sorted_route_weights = routing_weights.reshape(-1)[sorted_route_ids]
-        permuted_hidden_states = hidden_states[sorted_token_ids]
-        expert_outputs = torch.empty_like(permuted_hidden_states)
-
-        # Copy all offsets with one synchronization instead of calling .item()
-        # once per expert. TODO(you): replace this loop with grouped GEMM.
-        expert_offsets = routing_plan.expert_offsets.tolist()
-        for local_expert_id in range(self.last_expert_id - self.first_expert_id):
-            start = expert_offsets[local_expert_id]
-            end = expert_offsets[local_expert_id + 1]
-            if start == end:
-                continue
-            global_expert_id = self.first_expert_id + local_expert_id
-            expert_outputs[start:end] = self.experts[str(global_expert_id)](
-                permuted_hidden_states[start:end]
-            )
-
-        local_output = torch.zeros_like(hidden_states)
-        local_output.index_add_(
-            0,
-            sorted_token_ids,
-            expert_outputs * sorted_route_weights.unsqueeze(-1),
+        # 第一层 GEMM 融合输入 permutation；最后按 inverse 索引加权归并。
+        local_output = grouped_moe(
+            hidden_states, routing_weights, routing_plan,
+            self.grouped_gate_up, self.grouped_down,
         )
 
-        # Every EP rank must participate, including ranks with zero local tokens.
+        # 各 rank 持有同一批 token，分别计算各自专家的贡献，最后跨 rank 求和。
+        # 即使本 rank 没有本地路由，也必须参与 all_reduce。
         dist.all_reduce(local_output, group=self.ep_group)
         return local_output
 
