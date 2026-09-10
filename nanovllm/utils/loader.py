@@ -35,3 +35,11 @@ def load_model(model: nn.Module, path: str):
                     param = model.get_parameter(weight_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(weight_name))
+
+    for name, module in model.named_modules():
+        validate = getattr(module, "validate_loaded", None)
+        if validate is not None:
+            try:
+                validate()
+            except ValueError as error:
+                raise ValueError(f"{name}: {error}") from error

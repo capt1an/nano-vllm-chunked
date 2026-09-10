@@ -41,6 +41,7 @@ class ParallelStateTest(unittest.TestCase):
     @patch("nanovllm.config.AutoConfig.from_pretrained")
     def test_enabling_ep_does_not_increase_world_size(self, from_pretrained):
         from_pretrained.return_value.max_position_embeddings = 4096
+        from_pretrained.return_value.quantization_config = None
 
         config = Config(
             "unused",
