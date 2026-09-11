@@ -2,14 +2,17 @@ from copy import copy
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from itertools import count
+from uuid import uuid4
 
 from nanovllm.sampling_params import SamplingParams
+from nanovllm.distributed.kv_transfer.metadata import ConnectorMetadata, KVTransferParams
 
 
 class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
     FINISHED = auto()
+    WAITING_FOR_REMOTE_KVS = auto()
 
 
 @dataclass
@@ -38,6 +41,7 @@ class SchedulerOutput:
     seqs: list["Sequence"]
     num_prefill_seqs: int
     num_prefill_tokens: int
+    connector_metadata: ConnectorMetadata | None = None
 
     # ------------------------------------------------------------------ #
     # Convenience helpers                                                  #
@@ -71,8 +75,21 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params=SamplingParams()):
+    def __init__(self, token_ids: list[int], sampling_params=SamplingParams(), *,
+                 request_id: str | None = None,
+                 kv_transfer_params: KVTransferParams | None = None):
+        if request_id is not None and not request_id.strip():
+            raise ValueError("request_id must be nonempty")
+        if kv_transfer_params is not None:
+            if kv_transfer_params.num_tokens != len(token_ids):
+                raise ValueError("PD handoff must cover the full prompt")
+            if kv_transfer_params.block_size != self.block_size:
+                raise ValueError("PD handoff block_size must match the local block_size")
         self.seq_id = next(Sequence.counter)
+        # seq_id retains local output ordering; request_id identifies this request
+        # across control messages. Transfer attempts have their own transfer_id.
+        self.request_id = request_id if request_id is not None else uuid4().hex
+        self.kv_transfer_params = kv_transfer_params
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
@@ -161,7 +178,8 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        # is_prefill is now derived; serialise token_ids when in prefill phase
+        # Compact TP execution snapshot, NOT a full scheduler checkpoint or
+        # P-to-D request handoff. Decode workers only need the last token.
         last_state = self.last_token if not self.is_prefill else self.token_ids
         return (
             self.num_tokens,
@@ -170,6 +188,13 @@ class Sequence:
             self.num_scheduled_tokens,
             self.block_table,
             last_state,
+            self.seq_id,
+            self.request_id,
+            self.status,
+            self.kv_transfer_params,
+            self.temperature,
+            self.max_tokens,
+            self.ignore_eos,
         )
 
     def __setstate__(self, state):
@@ -180,6 +205,13 @@ class Sequence:
             self.num_scheduled_tokens,
             self.block_table,
             last_state,
+            self.seq_id,
+            self.request_id,
+            self.status,
+            self.kv_transfer_params,
+            self.temperature,
+            self.max_tokens,
+            self.ignore_eos,
         ) = state
         if isinstance(last_state, list):
             self.token_ids = last_state

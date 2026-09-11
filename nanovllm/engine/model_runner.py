@@ -1,4 +1,5 @@
 import pickle
+import os
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -29,7 +30,7 @@ class ModelRunner:
         self.event = event
 
         torch.cuda.set_device(rank)
-        dist.init_process_group("nccl", "tcp://localhost:8767", world_size=self.world_size, rank=rank)
+        dist.init_process_group("nccl", config.distributed_init_method, world_size=self.world_size, rank=rank)
         initialize_model_parallel(
             config.tensor_parallel_size,
             config.enable_expert_parallel,
@@ -47,17 +48,24 @@ class ModelRunner:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
+        self.connector = None
+        if config.pd_config is not None:
+            from nanovllm.distributed.kv_transfer.nixl import NixlWorkerConnector
+            self.connector = NixlWorkerConnector(config.pd_config, os.path.realpath(config.model))
+            self.connector.register_kv_cache(self.kv_cache)
 
         if self.world_size > 1:
             if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                self.shm = SharedMemory(name=config.worker_shm_name, create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(name=config.worker_shm_name)
                 self.loop()
 
     def exit(self):
+        if self.connector is not None:
+            self.connector.shutdown()
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -272,6 +280,19 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    def execute_step(self, output: SchedulerOutput):
+        """Advance KV transfers even when there is no model batch."""
+        from nanovllm.distributed.kv_transfer.metadata import ConnectorOutput
+        if self.connector is None:
+            return self.run(output) if output.seqs else [], ConnectorOutput()
+        self.connector.bind_connector_metadata(output.connector_metadata)
+        try:
+            self.connector.start_load_kv()
+            tokens = self.run(output) if output.seqs else []
+            return tokens, self.connector.get_finished()
+        finally:
+            self.connector.clear_connector_metadata()
     
     @torch.inference_mode()
     def capture_cudagraph(self):

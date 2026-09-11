@@ -72,6 +72,24 @@ class BlockManager:
         # are computed together, so one hash may map to multiple block IDs.
         self.hash_to_block_ids: dict[int, set[int]] = {}
         self.free_block_ids = EvictableBlockQueue(range(num_blocks))
+        self.reserved_block_ids: dict[int, list[int]] = {}
+
+    def allocate_exclusive(self, seq: Sequence, total_blocks: int) -> bool:
+        """Reserve a PD request's maximum footprint without publishing cache hits.
+
+        Future decode blocks are held separately so block_table only describes
+        the current sequence. Admission either reserves everything or changes nothing.
+        """
+        if seq.block_table or seq.seq_id in self.reserved_block_ids:
+            raise ValueError("Sequence already has KV blocks")
+        if total_blocks < seq.num_blocks:
+            raise ValueError("Reservation cannot be shorter than the prompt")
+        if total_blocks > len(self.free_block_ids):
+            return False
+        blocks = [self._allocate_block() for _ in range(total_blocks)]
+        seq.block_table.extend(blocks[:seq.num_blocks])
+        self.reserved_block_ids[seq.seq_id] = blocks[seq.num_blocks:]
+        return True
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -158,7 +176,8 @@ class BlockManager:
     def deallocate(self, seq: Sequence):
         # Releasing in reverse order makes request-specific suffix blocks
         # eviction candidates before the more reusable prefix blocks.
-        for block_id in reversed(seq.block_table):
+        blocks = seq.block_table + self.reserved_block_ids.pop(seq.seq_id, [])
+        for block_id in reversed(blocks):
             block = self.blocks[block_id]
             assert block.ref_count > 0
             block.ref_count -= 1
@@ -171,11 +190,14 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        return (len(seq.block_table) >= seq.num_blocks
+                or bool(self.reserved_block_ids.get(seq.seq_id))
+                or bool(len(self.free_block_ids)))
 
     def may_append(self, seq: Sequence):
-        if len(seq) % self.block_size == 1:
-            seq.block_table.append(self._allocate_block())
+        if len(seq.block_table) < seq.num_blocks:
+            reserved = self.reserved_block_ids.get(seq.seq_id)
+            seq.block_table.append(reserved.pop() if reserved else self._allocate_block())
 
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size

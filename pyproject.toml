@@ -23,6 +23,9 @@ dependencies = [
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 
+[project.optional-dependencies]
+pd = ["nixl==0.10.1", "nixl-cu12==1.4.1"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nanovllm*"]
