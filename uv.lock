@@ -270,13 +270,22 @@ dependencies = [
     { name = "xxhash" },
 ]
 
+[package.optional-dependencies]
+pd = [
+    { name = "nixl" },
+    { name = "nixl-cu12" },
+]
+
 [package.metadata]
 requires-dist = [
+    { name = "nixl", marker = "extra == 'pd'", specifier = "==0.10.1" },
+    { name = "nixl-cu12", marker = "extra == 'pd'", specifier = "==1.4.1" },
     { name = "torch", specifier = "==2.8.0" },
     { name = "transformers", specifier = ">=4.51.0" },
     { name = "triton", specifier = ">=3.0.0" },
     { name = "xxhash" },
 ]
+provides-extras = ["pd"]
 
 [[package]]
 name = "networkx"
@@ -304,6 +313,35 @@ resolution-markers = [
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/6a/51/63fe664f3908c97be9d2e4f1158eb633317598cfa6e1fc14af5383f17512/networkx-3.6.1.tar.gz", hash = "sha256:26b7c357accc0c8cde558ad486283728b65b6a95d85ee1cd66bafab4c8168509", size = 2517025, upload-time = "2025-12-08T17:02:39.908Z" }
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/9e/c9/b2622292ea83fbb4ec318f5b9ab867d0a28ab43c5717bb85b0a5f6b3b0a4/networkx-3.6.1-py3-none-any.whl", hash = "sha256:d47fbf302e7d9cbbb9e2555a0d267983d2aa476bac30e90dfbe5669bd57f3762", size = 2068504, upload-time = "2025-12-08T17:02:38.159Z" },
+]
+
+[[package]]
+name = "nixl"
+version = "0.10.1"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
+dependencies = [
+    { name = "nixl-cu12" },
+]
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/bb/a4/10e80e623790d3fb070e966b36bced009419d483c92ae0df6645230f606f/nixl-0.10.1-py3-none-any.whl", hash = "sha256:616465673dae5180d296525a03237af4cd5f2c00c3228d185bc06dbe621509b7", size = 6680, upload-time = "2026-03-03T19:55:44.848Z" },
+]
+
+[[package]]
+name = "nixl-cu12"
+version = "1.4.1"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "torch" },
+]
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/42/5e/31d839f83649f9d2c166e1fa541cfe2f187d1d0647b1567ea5599e621334/nixl_cu12-1.4.1-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:ef22926b3f7652414c786b3c54b3f96e0729a269cf998cf2ec5e6d64a46efe7e", size = 77546252, upload-time = "2026-09-01T23:42:54.531Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/ae/4c/a7f3bfca9f3e33ac4f902e192612aa3b8154b5a7bac3d95125020f69aa59/nixl_cu12-1.4.1-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:a2f33af6b9b65e414c8c7632009f7691d5caca27f3be3182ec485d11796820d1", size = 79287669, upload-time = "2026-09-01T23:40:49.72Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/fe/b5/938d9dadb5ac74d6bfdbbbb71574f17829d555dea66ed973191e29aa33d3/nixl_cu12-1.4.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:de2b2a845b0cf3da4a4bb9101b8eff4bcbfccf2e02cbdb43a0e4c9b37c7a79c8", size = 77554024, upload-time = "2026-09-01T23:43:18.724Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/25/c8/df62209657ed1b3c286e582a72bf3ffabcb551f18ea5b7958b149754c88c/nixl_cu12-1.4.1-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:cbdee61e963002bcf7f84f22a85ff77b938616ba2c9c7733da5868ecea26fb58", size = 79292000, upload-time = "2026-09-01T23:41:13.177Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/0a/5a/f601f1bc354bea37e5387e1ec899792bd498cc4f23eb9f10729bedd95f1e/nixl_cu12-1.4.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:8e5e42176d521fa01a4d88366f51e5085a0037b049e8c6a1e5e46a46f0aa84c7", size = 77570011, upload-time = "2026-09-01T23:43:48.286Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/c7/0a/977f05f15cb8ff080c106303633c46585c4fa10687e3dc64b0cd24fa56b1/nixl_cu12-1.4.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:bc3d4f99c85375c7836beef3736f038473c183aca16cb115131c61eb7240ba33", size = 79317179, upload-time = "2026-09-01T23:41:48.049Z" },
 ]
 
 [[package]]

@@ -3,6 +3,8 @@ from collections import deque
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus, SchedulerOutput
 from nanovllm.engine.block_manager import BlockManager
+from nanovllm.distributed.kv_transfer.config import PDRole
+from nanovllm.distributed.kv_transfer.scheduler import PullSchedulerConnector
 
 
 class Scheduler:
@@ -17,11 +19,39 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.pd_config = config.pd_config
+        self.max_model_len = config.max_model_len
+        self.connector = PullSchedulerConnector(config.pd_config) if config.pd_config else None
+        self.requests = {}
+        self.remote_waiting = {}
+        self.cancelled = set()
+        self.handoffs = deque()
+        self.failures = deque()
+        self._seen_transfer_ids = set()
 
     def is_finished(self):
-        return not self.waiting and not self.running
+        return not (self.waiting or self.running or self.remote_waiting
+                    or (self.connector and self.connector.has_pending_work()))
 
     def add(self, seq: Sequence):
+        if self.connector:
+            if seq.request_id in self.requests:
+                raise ValueError("Duplicate request_id")
+            if not seq.token_ids or seq.max_tokens < 1:
+                raise ValueError("Nonempty prompt and positive max_tokens required")
+            decode = self.pd_config.role == PDRole.DECODE
+            if decode != (seq.kv_transfer_params is not None):
+                raise ValueError("Only decode requests require a remote KV handoff")
+            if decode and seq.kv_transfer_params.transfer_id in self._seen_transfer_ids:
+                raise ValueError("Duplicate transfer attempt")
+            total = seq.num_prompt_tokens + (seq.max_tokens if decode else 0)
+            if total > self.max_model_len or (total + self.block_size - 1) // self.block_size > len(self.block_manager.blocks):
+                raise ValueError("PD request exceeds model length or KV capacity")
+            if not decode and not self.enable_chunked_prefill and seq.num_prompt_tokens > self.max_num_batched_tokens:
+                raise ValueError("Prompt exceeds token budget with chunked prefill disabled")
+            self.requests[seq.request_id] = seq
+            if decode:
+                self._seen_transfer_ids.add(seq.kv_transfer_params.transfer_id)
         self.waiting.append(seq)
 
     # ------------------------------------------------------------------ #
@@ -29,10 +59,117 @@ class Scheduler:
     # ------------------------------------------------------------------ #
 
     def schedule(self) -> SchedulerOutput:
+        if self.connector:
+            return self._schedule_pd()
         if self.enable_continuous_batching:
             return self._schedule_continuous_batching()
         else:
             return self._schedule_legacy()
+
+    def _schedule_pd(self):
+        # Reserve full footprints at admission: PD never preempts into a local
+        # prompt recomputation. Scan waiting requests so one large request does
+        # not block smaller requests that fit while transfers are in flight.
+        for _ in range(len(self.waiting)):
+            seq = self.waiting.popleft()
+            if len(self.running) + len(self.remote_waiting) >= self.max_num_seqs:
+                self.waiting.append(seq)
+                continue
+            is_decode = self.pd_config.role == PDRole.DECODE
+            total = seq.num_prompt_tokens + (seq.max_tokens if is_decode else 0)
+            count = (total + self.block_size - 1) // self.block_size
+            if not self.block_manager.allocate_exclusive(seq, count):
+                self.waiting.append(seq)
+                continue
+            if is_decode:
+                tokens, _ = self.connector.get_num_new_matched_tokens(seq, 0)
+                seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+                self.remote_waiting[seq.request_id] = seq
+                self.connector.update_state_after_alloc(seq, tuple(seq.block_table), tokens)
+            else:
+                seq.status = SequenceStatus.RUNNING
+                self.running.append(seq)
+
+        prefill, decode = [], []
+        budget = self.max_num_batched_tokens
+        # Round-robin within each phase; ready decode requests get first choice.
+        candidates = sorted(self.running, key=lambda seq: seq.is_prefill)
+        for seq in candidates:
+            if not budget:
+                break
+            if not self.enable_continuous_batching and (prefill or decode):
+                if seq.is_prefill != bool(prefill):
+                    continue
+            needed = seq.num_prefill_tokens_remaining if seq.is_prefill else 1
+            if seq.is_prefill and not self.enable_chunked_prefill and needed > budget:
+                continue
+            seq.num_scheduled_tokens = min(needed, budget)
+            if seq.is_prefill:
+                prefill.append(seq)
+            else:
+                self.block_manager.may_append(seq)
+                decode.append(seq)
+            budget -= seq.num_scheduled_tokens
+            self.running.remove(seq)
+            self.running.append(seq)
+        output = SchedulerOutput(prefill + decode, len(prefill),
+                                 sum(seq.num_scheduled_tokens for seq in prefill))
+        output.connector_metadata = self.connector.build_connector_meta(output)
+        return output
+
+    def update_connector_output(self, output):
+        if not self.connector:
+            return
+        failures = {event.transfer_id: event.message for event in output.failures}
+        terminal = output.received | output.sent | output.cancelled | failures.keys()
+        for transfer_id in terminal:
+            request_id = self.connector.pending.get(transfer_id)
+            seq = self.requests.get(request_id)
+            if seq is None:  # Late/duplicate event from an old attempt.
+                continue
+            if transfer_id in output.received and request_id not in self.cancelled:
+                self.remote_waiting.pop(request_id, None)
+                # Full prompt KV has no logits. Recompute its last token on D.
+                seq.num_cached_tokens = seq.num_prompt_tokens - 1
+                seq.status = SequenceStatus.RUNNING
+                self.running.append(seq)
+            else:
+                if transfer_id in failures:
+                    self.failures.append((request_id, failures[transfer_id]))
+                self._release_pd(seq)
+        self.connector.update_connector_output(output)
+
+    def _release_pd(self, seq):
+        self.remote_waiting.pop(seq.request_id, None)
+        self.requests.pop(seq.request_id, None)
+        self.cancelled.discard(seq.request_id)
+        seq.status = SequenceStatus.FINISHED
+        self.block_manager.deallocate(seq)
+
+    def cancel_request(self, request_id):
+        if not self.connector:
+            raise ValueError("Cancellation interface currently requires PD")
+        seq = self.requests.get(request_id)
+        if seq is None:
+            return
+        for queue in (self.waiting, self.running):
+            if seq in queue:
+                queue.remove(seq)
+        if request_id in self.connector.pending.values():
+            self.cancelled.add(request_id)
+            self.connector.cancel_request(seq)
+        else:
+            self._release_pd(seq)
+
+    def shutdown(self):
+        """Reclaim scheduler ownership only AFTER worker transport shutdown."""
+        if self.connector:
+            self.waiting.clear()
+            self.running.clear()
+            for seq in list(self.requests.values()):
+                self._release_pd(seq)
+            self.connector.pending.clear()
+            self.connector.shutdown()
 
     # ------------------------------------------------------------------ #
     # Continuous batching (new)                                            #
@@ -256,12 +393,20 @@ class Scheduler:
             accounting matters.
         """
         for seq, token_id in zip(output.seqs, token_ids):
-            self.block_manager.hash_blocks(seq)
+            if not self.connector:
+                self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
 
             # Prefill seq that still has un-prefilled tokens: skip token emit.
             if seq.is_prefill:
+                continue
+
+            if self.connector and self.pd_config.role == PDRole.PREFILL:
+                self.running.remove(seq)
+                seq.status = SequenceStatus.FINISHED
+                _, handoff = self.connector.request_finished(seq, tuple(seq.block_table))
+                self.handoffs.append((seq.request_id, handoff))
                 continue
 
             seq.append_token(token_id)
@@ -271,7 +416,10 @@ class Scheduler:
             ):
                 seq.status = SequenceStatus.FINISHED
                 # print("触发deallocate!")
-                self.block_manager.deallocate(seq)
+                if self.connector:
+                    self._release_pd(seq)
+                else:
+                    self.block_manager.deallocate(seq)
                 # running.remove is O(n) but the list is short in practice.
                 if seq in self.running:
                     self.running.remove(seq)

@@ -18,6 +18,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -38,24 +39,44 @@ class LLMEngine:
         if not hasattr(self, "model_runner") or self.model_runner is None:
             return
         self.model_runner.call("exit")
+        self.scheduler.shutdown()
         del self.model_runner
         self.model_runner = None
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams, *,
+                    request_id=None, kv_transfer_params=None):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
+        seq = Sequence(prompt, sampling_params, request_id=request_id,
+                       kv_transfer_params=kv_transfer_params)
         self.scheduler.add(seq)
+        return seq.request_id
 
     def step(self):
         output: SchedulerOutput = self.scheduler.schedule()
         # print("scheduler output: ", output.seqs)
-        token_ids = self.model_runner.call("run", output)
+        token_ids, connector_output = self.model_runner.call("execute_step", output)
         self.scheduler.postprocess(output, token_ids)
+        self.scheduler.update_connector_output(connector_output)
         finished = [(seq.seq_id, seq.completion_token_ids) for seq in output.seqs if seq.is_finished]
+        if self.config.pd_config and self.config.pd_config.role == "prefill":
+            finished = []
         return finished, output.num_prefill_tokens, len(output.decode_seqs)
+
+    def get_kv_handoffs(self):
+        handoffs = list(self.scheduler.handoffs)
+        self.scheduler.handoffs.clear()
+        return handoffs
+
+    def get_transfer_failures(self):
+        failures = list(self.scheduler.failures)
+        self.scheduler.failures.clear()
+        return failures
+
+    def cancel_request(self, request_id):
+        self.scheduler.cancel_request(request_id)
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -66,6 +87,8 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
+        if self.config.pd_config:
+            raise ValueError("PD engines require add_request/step and handoff routing; see examples/qwen3_pd.py")
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
