@@ -64,3 +64,25 @@ See `bench.py` for benchmark.
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+### Qwen3 AWQ inference
+
+Dense Qwen3 AWQ checkpoints are detected from `quantization_config`. The initial
+implementation supports AWQ GEMM INT4, group size 128, asymmetric zero points,
+FP16 execution and a single GPU (`tensor_parallel_size=1`). TP/EP, quantized
+attention bias and custom `modules_to_not_convert` lists are not supported.
+Embedding and normalization checkpoint weights are converted to the execution
+dtype; the tied LM head continues to share the embedding storage.
+
+```bash
+python -m examples.qwen3_awq /path/to/Qwen3-4B-AWQ --eager
+# Enable CUDA Graph for decode:
+python -m examples.qwen3_awq /path/to/Qwen3-4B-AWQ
+python -m unittest discover -s tests -p test_awq.py -v
+```
+
+Weights remain packed in GPU memory. The Triton kernel unpacks and dequantizes
+weight tiles during GEMM with FP32 accumulation; it does not retain a full FP16
+copy of each linear weight. This first implementation prioritizes correctness,
+with no tuned prefill/decode kernel selection. GPU tests compare against a
+PyTorch dequantization reference and exercise CUDA Graph replay. The example
+runs two short prompts; it is not a model-quality or performance benchmark.

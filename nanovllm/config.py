@@ -25,6 +25,15 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        quant = getattr(self.hf_config, "quantization_config", None)
+        if quant is not None:
+            from nanovllm.layers.awq import validate_awq
+            import torch
+            validate_awq(quant)
+            if self.hf_config.model_type != "qwen3" or self.tensor_parallel_size != 1 or self.enable_expert_parallel:
+                raise ValueError("AWQ currently supports dense Qwen3 with TP=1 and no EP")
+            if self.hf_config.dtype != torch.float16:
+                raise ValueError("AWQ currently requires float16 model dtype")
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
 
     @property

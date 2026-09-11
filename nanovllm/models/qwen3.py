@@ -3,6 +3,7 @@ from torch import nn
 from transformers import Qwen3Config
 
 from nanovllm.distributed import get_tensor_parallel_world_size
+from nanovllm.layers.awq import AWQLinear, validate_awq
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
@@ -24,6 +25,7 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: dict | None = None,
+        quantization_config: dict | None = None,
     ) -> None:
         super().__init__()
         tp_size = get_tensor_parallel_world_size()
@@ -39,18 +41,25 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=qkv_bias,
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=False,
-        )
+        if quantization_config is not None:
+            validate_awq(quantization_config)
+            if qkv_bias:
+                raise ValueError("AWQ attention bias is not supported")
+            self.qkv_proj = AWQLinear(hidden_size, [self.q_size, self.kv_size, self.kv_size], ["q", "k", "v"])
+            self.o_proj = AWQLinear(self.total_num_heads * self.head_dim, [hidden_size])
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=qkv_bias,
+            )
+            self.o_proj = RowParallelLinear(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                bias=False,
+            )
         if isinstance(rope_scaling, dict):
             rope_theta = rope_scaling.get("rope_theta", rope_theta)
         self.rotary_emb = get_rope(
@@ -95,18 +104,24 @@ class Qwen3MLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        quantization_config: dict | None = None,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-        )
+        if quantization_config is not None:
+            validate_awq(quantization_config)
+            self.gate_up_proj = AWQLinear(hidden_size, [intermediate_size] * 2, [0, 1])
+            self.down_proj = AWQLinear(intermediate_size, [hidden_size])
+        else:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+            )
+            self.down_proj = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+            )
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
 
@@ -134,11 +149,13 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            quantization_config=getattr(config, "quantization_config", None),
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
+            quantization_config=getattr(config, "quantization_config", None),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
