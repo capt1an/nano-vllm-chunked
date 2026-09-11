@@ -124,6 +124,35 @@ class GroupedMoETest(unittest.TestCase):
                 with self.subTest(dtype=dtype, tokens=tokens, mode=mode):
                     self.run_case(dtype, tokens, hidden, intermediate, mode)
 
+    @torch.inference_mode()
+    def test_eight_token_decode_against_fp32_reference(self):
+        # Qwen3-30B-A3B 的真实 EP=2 专家尺寸；8 个请求各提供一个 decode token。
+        # 与独立 FP32 专家计算比较，而不是要求不同 BF16 归约路径逐位相同。
+        torch.manual_seed(29)
+        x = torch.randn(8, 2048, device='cuda', dtype=torch.bfloat16) * 0.5
+        w1 = torch.randn(64, 1536, 2048, device='cuda', dtype=x.dtype) * 0.02
+        w2 = torch.randn(64, 2048, 768, device='cuda', dtype=x.dtype) * 0.02
+        selected = torch.rand(8, 128, device='cuda').topk(8, -1).indices
+        weights = torch.softmax(torch.randn(8, 8, device='cuda'), -1).to(x.dtype)
+        plan = counting_sort_moe_routes(selected, 0, 64, capacity_buffer=True)
+        actual = grouped_moe(x, weights, plan, w1, w2)
+        expected = torch.zeros_like(x, dtype=torch.float32)
+        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            for e in range(64):
+                token, slot = torch.where(selected == e)
+                if token.numel() == 0:
+                    continue
+                gate, up = F.linear(x[token].float(), w1[e].float()).chunk(2, -1)
+                value = F.linear(F.silu(gate) * up, w2[e].float())
+                expected.index_add_(0, token, value * weights[token, slot, None].float())
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+        error = (actual.float() - expected).norm() / expected.norm()
+        self.assertLess(error.item(), 0.01, 'BF16 grouped MoE relative L2 error exceeds 1%')
+        self.assertTrue(torch.isfinite(actual).all())
+
     def test_graph_replay_with_changed_routes(self):
         x, weights, selected, w1, w2 = self.run_case(torch.float16, 37, 70, 45, 'random')
         def run():
