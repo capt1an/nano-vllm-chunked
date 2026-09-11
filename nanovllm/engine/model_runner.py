@@ -5,8 +5,13 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
+from nanovllm.distributed import (
+    destroy_model_parallel,
+    get_tensor_parallel_world_size,
+    initialize_model_parallel,
+)
 from nanovllm.engine.sequence import Sequence, SchedulerOutput
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.registry import get_model_class
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import Context, set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -19,16 +24,21 @@ class ModelRunner:
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
+        self.world_size = config.world_size
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:8767", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
+        dist.init_process_group("nccl", "tcp://localhost:8767", world_size=self.world_size, rank=rank)
+        initialize_model_parallel(
+            config.tensor_parallel_size,
+            config.enable_expert_parallel,
+        )
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        model_class = get_model_class(hf_config)
+        self.model = model_class(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -56,6 +66,7 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
+        destroy_model_parallel()
         dist.destroy_process_group()
 
     def loop(self):
@@ -112,7 +123,8 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        tp_size = get_tensor_parallel_world_size()
+        num_kv_heads = hf_config.num_key_value_heads // tp_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
